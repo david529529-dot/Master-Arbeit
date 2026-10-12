@@ -1,0 +1,288 @@
+# SLIC-Superpixel mit zwei austauschbaren Clustering-Verfahren:
+#   method="kmeans"  -> Original-SLIC (Achanta et al.): harte Zuordnung, Zentrum = Mittelwert
+#   method="ng"      -> Batch-Neural-Gas: rangbasierte, weiche Zuordnung mit Annealing von lambda
+# Beide Varianten teilen Initialisierung, Distanzmaß, lokale 2S x 2S-Suche und Konnektivitäts-Schritt,
+# damit Unterschiede im Ergebnis nur vom Clustering-Verfahren kommen.
+
+import time
+import numpy as np
+from scipy import ndimage
+from skimage.color import rgb2lab
+
+
+# ========== Hilfsfunktionen ==========
+def _lab_gradient(lab):
+    # G(x,y) = ||I(x+1,y)-I(x-1,y)||^2 + ||I(x,y+1)-I(x,y-1)||^2  (Gl. 2 im SLIC-Paper)
+    p = np.pad(lab, ((1, 1), (1, 1), (0, 0)), mode="edge")
+    gx = p[1:-1, 2:] - p[1:-1, :-2]
+    gy = p[2:, 1:-1] - p[:-2, 1:-1]
+    return (gx ** 2).sum(-1) + (gy ** 2).sum(-1)
+
+
+def _init_centers(lab, S):
+    # Zentren auf regelmäßigem Gitter mit Abstand S, dann ins Gradientenminimum der 3x3-Nachbarschaft
+    H, W, _ = lab.shape
+    grad = _lab_gradient(lab)
+    ys = np.arange(S / 2, H, S)
+    xs = np.arange(S / 2, W, S)
+    centers = []
+    for y in ys:
+        for x in xs:
+            yi, xi = int(round(y)), int(round(x))
+            y0, y1 = max(yi - 1, 0), min(yi + 2, H)
+            x0, x1 = max(xi - 1, 0), min(xi + 2, W)
+            win = grad[y0:y1, x0:x1]
+            dy, dx = np.unravel_index(np.argmin(win), win.shape)
+            yy, xx = y0 + dy, x0 + dx
+            centers.append([*lab[yy, xx], yy, xx])  # [l, a, b, y, x] in Pixelkoordinaten
+    return np.asarray(centers, dtype=np.float64)
+
+
+def _candidate_distances(feats, centers, S, m):
+    # Für jedes Zentrum: Distanzen zu allen Pixeln im 2S x 2S-Fenster.
+    # Rückgabe als flache Tripel (pixel_index, center_index, distanz_quadrat).
+    H, W, _ = feats.shape
+    scale = m / S
+    pix_l, cen_l, dist_l = [], [], []
+    for k, c in enumerate(centers):
+        cy, cx = c[3], c[4]
+        y0, y1 = max(int(cy - S), 0), min(int(cy + S) + 1, H)
+        x0, x1 = max(int(cx - S), 0), min(int(cx + S) + 1, W)
+        if y0 >= y1 or x0 >= x1:
+            continue
+        win = feats[y0:y1, x0:x1].reshape(-1, 5)
+        c_feat = np.array([c[0], c[1], c[2], c[3] * scale, c[4] * scale])
+        # Euklidisch im skalierten Raum = sqrt(d_c^2 + (d_s/S)^2 * m^2)
+        d2 = ((win - c_feat) ** 2).sum(1)
+        yy, xx = np.mgrid[y0:y1, x0:x1]
+        pix_l.append((yy * W + xx).ravel())
+        cen_l.append(np.full(d2.shape, k))
+        dist_l.append(d2)
+    return np.concatenate(pix_l), np.concatenate(cen_l), np.concatenate(dist_l)
+
+
+def _ranks_per_pixel(pix, dist):
+    # Sortiert Kandidaten pro Pixel nach Distanz und vergibt Ränge 0, 1, 2, ...
+    order = np.lexsort((dist, pix))
+    pix_s = pix[order]
+    idx = np.arange(len(pix_s))
+    is_start = np.r_[True, pix_s[1:] != pix_s[:-1]]
+    group_start = np.maximum.accumulate(np.where(is_start, idx, 0))
+    ranks = np.empty_like(order)
+    ranks[order] = idx - group_start
+    return ranks
+
+
+def _enforce_connectivity(labels):
+    # Pro Label nur die größte Zusammenhangskomponente behalten, Rest (und nicht
+    # erreichte Pixel = -1) dem räumlich nächsten gültigen Label zuordnen.
+    out = labels.copy()
+    for l in np.unique(labels):
+        if l < 0:
+            continue
+        comp, n = ndimage.label(labels == l)
+        if n > 1:
+            sizes = ndimage.sum(np.ones_like(comp), comp, index=np.arange(1, n + 1))
+            keep = np.argmax(sizes) + 1
+            out[(comp > 0) & (comp != keep)] = -1
+    if (out < 0).any():
+        _, (iy, ix) = ndimage.distance_transform_edt(out < 0, return_indices=True)
+        out = out[iy, ix]
+    # Labels lückenlos 0..K-1 durchnummerieren; kept[l] = ursprünglicher Zentrumsindex von Label l
+    kept, out = np.unique(out, return_inverse=True)
+    return out.reshape(labels.shape), kept
+
+
+# ========== Hauptfunktion ==========
+def slic(image_rgb, n_segments=200, m=10.0, method="kmeans", n_iter=10,
+         lambda_start=2.0, lambda_end=0.01, tol=1e-2, return_info=False, chl_min_count=5):
+    """
+    image_rgb : (H, W, 3) uint8 oder float in [0,1]
+    n_segments: gewünschte Anzahl Superpixel K
+    m         : Kompaktheit (größer = regelmäßigere Superpixel)
+    method    : "kmeans" oder "ng"
+    n_iter    : Iterationen (bei "ng" = Länge des Annealing-Plans)
+    lambda_*  : Nachbarschaftsbreite für NG, exponentiell von start nach end
+    tol       : Abbruch bei k-means, wenn mittlere L1-Verschiebung der Zentren < tol
+    chl_min_count: CHL-Kanten, die von weniger Pixeln gestützt werden, gelten als Rauschen
+    return_info: liefert zusätzlich Verlauf, Zentren und den CHL-Graphen (chl_edges, chl_counts)
+    """
+    if method not in ("kmeans", "ng"):
+        raise ValueError(f"Unbekannte Methode: {method}")
+    t0 = time.perf_counter()
+
+    img = np.asarray(image_rgb)
+    if img.dtype == np.uint8:
+        img = img.astype(np.float64) / 255.0
+    lab = rgb2lab(img)
+    H, W, _ = lab.shape
+    N = H * W
+    S = np.sqrt(N / n_segments)
+    scale = m / S
+
+    # Feature-Bild [l, a, b, (m/S)*y, (m/S)*x] -> euklidische Distanz = SLIC-Distanz D
+    yy, xx = np.mgrid[0:H, 0:W]
+    feats = np.dstack([lab, yy * scale, xx * scale])
+    flat = feats.reshape(-1, 5)
+
+    centers = _init_centers(lab, S)
+    K = len(centers)
+    history = []
+
+    for t in range(n_iter):
+        pix, cen, d2 = _candidate_distances(feats, centers, S, m)
+        ranks = _ranks_per_pixel(pix, d2)
+
+        if method == "kmeans":
+            w = (ranks == 0).astype(np.float64)          # nur der Gewinner zählt
+            lam = 0.0
+        else:
+            lam = lambda_start * (lambda_end / lambda_start) ** (t / max(n_iter - 1, 1))
+            w = np.exp(-ranks / lam)                      # h_lambda(k) = exp(-k / lambda)
+
+        # Gewichteter Mittelwert pro Zentrum (bei kmeans: normaler Mittelwert)
+        denom = np.bincount(cen, weights=w, minlength=K)
+        new_feat = np.stack([np.bincount(cen, weights=w * flat[pix, j], minlength=K)
+                             for j in range(5)], axis=1)
+        valid = denom > 1e-12
+        new_centers = centers.copy()
+        new_centers[valid] = new_feat[valid] / denom[valid, None]
+        new_centers[valid, 3:] /= scale                   # Position zurück in Pixelkoordinaten
+
+        shift = np.abs(new_centers - centers).sum(1).mean()
+        winner = ranks == 0
+        energy = d2[winner].mean()                        # mittlere quadr. Quantisierungsfehler
+        history.append({"iter": t, "lambda": lam, "shift": shift, "energy": energy})
+        centers = new_centers
+
+        if method == "kmeans" and shift < tol:
+            break
+
+    # Finale harte Zuordnung (entspricht lambda -> 0)
+    pix, cen, d2 = _candidate_distances(feats, centers, S, m)
+    ranks = _ranks_per_pixel(pix, d2)
+    labels = np.full(N, -1, dtype=np.int64)
+    labels[pix[ranks == 0]] = cen[ranks == 0]
+    labels, kept = _enforce_connectivity(labels.reshape(H, W))
+
+    if not return_info:
+        return labels
+
+    # Competitive Hebbian Learning (Martinetz 1993): pro Pixel eine Kante zwischen dem
+    # nächsten und zweitnächsten Zentrum -> induzierte Delaunay-Triangulation der Zentren
+    c0 = np.full(N, -1); c1 = np.full(N, -1)
+    c0[pix[ranks == 0]] = cen[ranks == 0]
+    c1[pix[ranks == 1]] = cen[ranks == 1]
+    ok = (c0 >= 0) & (c1 >= 0)
+    a, b = np.minimum(c0[ok], c1[ok]), np.maximum(c0[ok], c1[ok])
+    pairs, counts = np.unique(np.stack([a, b], 1), axis=0, return_counts=True)
+    # Auf finale Labels umrechnen (Zentren, die beim Konnektivitäts-Schritt weggefallen sind, entfallen)
+    to_label = np.full(K, -1); to_label[kept] = np.arange(len(kept))
+    la, lb = to_label[pairs[:, 0]], to_label[pairs[:, 1]]
+    keep = (la >= 0) & (lb >= 0) & (counts >= chl_min_count)
+
+    info = {"history": history, "n_centers_init": K, "n_segments_final": int(labels.max() + 1),
+            "S": S, "runtime_s": time.perf_counter() - t0,
+            "centers": centers[kept],                     # [l, a, b, y, x] pro finalem Label
+            "chl_edges": np.stack([la[keep], lb[keep]], 1),
+            "chl_counts": counts[keep]}
+    return labels, info
+
+
+# ========== Metriken ohne Ground Truth ==========
+def quantization_error(image_rgb, labels):
+    # Mittlere Lab-Varianz innerhalb der Superpixel (kleiner = homogenere Superpixel)
+    img = np.asarray(image_rgb)
+    if img.dtype == np.uint8:
+        img = img.astype(np.float64) / 255.0
+    lab = rgb2lab(img).reshape(-1, 3)
+    lbl = labels.ravel()
+    cnt = np.bincount(lbl)
+    err = 0.0
+    for j in range(3):
+        s = np.bincount(lbl, weights=lab[:, j])
+        s2 = np.bincount(lbl, weights=lab[:, j] ** 2)
+        err += (s2 - s ** 2 / cnt).sum()
+    return err / len(lbl)
+
+
+def compactness(labels):
+    # Mittlere isoperimetrische Kompaktheit 4*pi*A / P^2, gewichtet mit der Fläche (Schick et al. 2012)
+    H, W = labels.shape
+    pad = np.pad(labels, 1, constant_values=-1)
+    inner = pad[1:-1, 1:-1]
+    perim = np.zeros(labels.max() + 1)
+    for sl in [(slice(0, -2), slice(1, -1)), (slice(2, None), slice(1, -1)),
+               (slice(1, -1), slice(0, -2)), (slice(1, -1), slice(2, None))]:
+        diff = pad[sl] != inner
+        perim += np.bincount(inner[diff], minlength=len(perim))
+    area = np.bincount(labels.ravel(), minlength=len(perim)).astype(np.float64)
+    q = 4 * np.pi * area / np.maximum(perim, 1) ** 2
+    return float((q * area).sum() / area.sum())
+
+
+# ========== Metriken mit Ground Truth (z. B. Flowers102 segmim) ==========
+def mask_from_segmim(segmim_rgb, thr=60):
+    # In segmim ist der Hintergrund reines Blau (ca. 0, 0, 254). Wegen JPEG-Artefakten mit Toleranz.
+    s = np.asarray(segmim_rgb).astype(np.int32)
+    background = (s[..., 0] < thr) & (s[..., 1] < thr) & (s[..., 2] > 255 - thr)
+    mask = ~background
+    # Kleine Ausreißer entfernen (JPEG-Rauschen an den Rändern)
+    mask = ndimage.binary_opening(mask, iterations=1)
+    return mask.astype(np.int64)  # 1 = Blume, 0 = Hintergrund
+
+
+def _boundaries(labels):
+    b = np.zeros(labels.shape, dtype=bool)
+    b[:, :-1] |= labels[:, :-1] != labels[:, 1:]
+    b[:-1, :] |= labels[:-1, :] != labels[1:, :]
+    return b
+
+
+def boundary_recall(labels, gt, tol=2):
+    # Anteil der GT-Randpixel, die höchstens tol Pixel von einem Superpixelrand entfernt sind
+    gt_b = _boundaries(gt)
+    if gt_b.sum() == 0:
+        return float("nan")
+    sp_b = ndimage.binary_dilation(_boundaries(labels), iterations=tol)
+    return float((gt_b & sp_b).sum() / gt_b.sum())
+
+
+def undersegmentation_error(labels, gt):
+    # Korrigierte Variante nach Neubert & Protzel (2012):
+    # sum_g sum_{s schneidet g} min(|s ∩ g|, |s \ g|) / N
+    N = labels.size
+    n_sp, n_gt = labels.max() + 1, gt.max() + 1
+    joint = np.bincount(labels.ravel() * n_gt + gt.ravel(), minlength=n_sp * n_gt).reshape(n_sp, n_gt)
+    sp_size = joint.sum(1, keepdims=True)
+    return float(np.minimum(joint, sp_size - joint)[joint > 0].sum() / N)
+
+
+def achievable_segmentation_accuracy(labels, gt):
+    # Jeder Superpixel bekommt sein Mehrheits-GT-Label; Anteil korrekt gelabelter Pixel
+    n_gt = gt.max() + 1
+    joint = np.bincount(labels.ravel() * n_gt + gt.ravel(),
+                        minlength=(labels.max() + 1) * n_gt).reshape(-1, n_gt)
+    return float(joint.max(1).sum() / labels.size)
+
+
+# ========== Torchvision-kompatible Transform ==========
+class SLICMeanColor:
+    """Ersetzt jeden Superpixel durch seine mittlere RGB-Farbe. Nutzbar in transforms.Compose
+    vor ToTensor() (erwartet PIL-Image, gibt PIL-Image zurück)."""
+
+    def __init__(self, n_segments=200, m=10.0, method="kmeans", **kwargs):
+        self.kw = dict(n_segments=n_segments, m=m, method=method, **kwargs)
+
+    def __call__(self, pil_img):
+        from PIL import Image
+        arr = np.asarray(pil_img.convert("RGB"))
+        labels = slic(arr, **self.kw)
+        flat = arr.reshape(-1, 3).astype(np.float64)
+        lbl = labels.ravel()
+        cnt = np.bincount(lbl)[:, None]
+        means = np.stack([np.bincount(lbl, weights=flat[:, j]) for j in range(3)], 1) / cnt
+        return Image.fromarray(means[lbl].reshape(arr.shape).round().astype(np.uint8))
+
+    def __repr__(self):
+        return f"SLICMeanColor({self.kw})"
