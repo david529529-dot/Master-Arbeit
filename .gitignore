@@ -1,0 +1,7 @@
+data/
+runs/
+Fotos/
+*.pth
+log*.txt
+__pycache__/
+*.pyc
